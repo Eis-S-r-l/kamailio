@@ -1010,7 +1010,6 @@ int dp_init_priority_weights(ds_set_t *dset)
 	/* if no weights are set, distribute equally among highest priority destinations */
 	if(weight_sum == 0) {
 		int count = 0;
-		int *hp_indices = NULL;
 		int hp_count = 0;
 
 		/* count destinations with highest priority */
