@@ -82,6 +82,7 @@
 #define DS_ALG_PARALLEL 12
 #define DS_ALG_LATENCY 13
 #define DS_ALG_RRSERIAL 14
+#define DS_ALG_PRIORITY_WEIGHT 15
 #define DS_ALG_OVERLOAD 64 /* 2^6 - can be also used as a flag */
 
 #define DS_HN_SIZE 256
@@ -982,6 +983,140 @@ ret:
 
 
 /**
+ * Initialize the priority-weight distribution for a destination set
+ * - first find the highest priority among all active destinations
+ * - then select only destinations with that priority
+ * - finally distribute calls among them based on their weight
+ * - fill the array of 0..99 elements where to keep the index of the
+ *   destination address to be used. The Nth call will use
+ *   the address with the index at position N%100
+ */
+int dp_init_priority_weights(ds_set_t *dset)
+{
+	int j;
+	int k;
+	int t;
+	int *ds_dests_flags = NULL;
+	int *ds_dests_weights = NULL;
+	int *ds_dests_priorities = NULL;
+	int highest_priority;
+	int weight_sum;
+	int current_slice;
+	unsigned int last_insert;
+
+	if(dset == NULL || dset->dlist == NULL || dset->nr < 1)
+		return -1;
+
+	/* local copy to avoid synchronization problems */
+	ds_dests_flags = pkg_malloc(sizeof(int) * dset->nr);
+	if(ds_dests_flags == NULL) {
+		PKG_MEM_ERROR;
+		return -1;
+	}
+	ds_dests_weights = pkg_malloc(sizeof(int) * dset->nr);
+	if(ds_dests_weights == NULL) {
+		PKG_MEM_ERROR;
+		pkg_free(ds_dests_flags);
+		return -1;
+	}
+	ds_dests_priorities = pkg_malloc(sizeof(int) * dset->nr);
+	if(ds_dests_priorities == NULL) {
+		PKG_MEM_ERROR;
+		pkg_free(ds_dests_flags);
+		pkg_free(ds_dests_weights);
+		return -1;
+	}
+
+	/* needed to sync the pwlist access */
+	lock_get(&dset->lock);
+
+	/* copy local data and find the highest priority */
+	highest_priority = -1;
+	for(j = 0; j < dset->nr; j++) {
+		ds_dests_flags[j] = dset->dlist[j].flags;
+		ds_dests_weights[j] = dset->dlist[j].attrs.weight;
+		ds_dests_priorities[j] = dset->dlist[j].priority;
+		if(ds_skip_dst(ds_dests_flags[j]))
+			continue;
+		if(highest_priority < 0 || ds_dests_priorities[j] > highest_priority) {
+			highest_priority = ds_dests_priorities[j];
+		}
+	}
+
+	if(highest_priority < 0) {
+		/* no active destinations */
+		goto ret;
+	}
+
+	/* calculate the sum of weights for destinations with highest priority */
+	weight_sum = 0;
+	for(j = 0; j < dset->nr; j++) {
+		if(ds_skip_dst(ds_dests_flags[j]))
+			continue;
+		if(ds_dests_priorities[j] != highest_priority)
+			continue;
+		weight_sum += ds_dests_weights[j];
+	}
+
+	/* if no weights are set, use equal distribution */
+	if(weight_sum == 0) {
+		t = 0;
+		for(j = 0; j < dset->nr; j++) {
+			if(ds_skip_dst(ds_dests_flags[j]))
+				continue;
+			if(ds_dests_priorities[j] != highest_priority)
+				continue;
+			/* assign equal weight to each destination with highest priority */
+			ds_dests_weights[j] = 1;
+			weight_sum++;
+		}
+	}
+
+	/* fill the array based on the weight of each destination with highest priority */
+	t = 0;
+	for(j = 0; j < dset->nr; j++) {
+		if(ds_skip_dst(ds_dests_flags[j]))
+			continue;
+		if(ds_dests_priorities[j] != highest_priority)
+			continue;
+
+		current_slice = ds_dests_weights[j] * 100 / weight_sum; /* truncate here */
+		if(current_slice == 0 && ds_dests_weights[j] > 0) {
+			current_slice = 1; /* at least one slot if weight > 0 */
+		}
+		LM_DBG("priority_weight[%d][priority=%d][weight=%d][slice=%d]\n",
+				j, ds_dests_priorities[j], ds_dests_weights[j], current_slice);
+		for(k = 0; k < current_slice && t < 100; k++) {
+			dset->pwlist[t] = (unsigned int)j;
+			t++;
+		}
+	}
+
+	/* if the array was not completely filled, use last address to fill the rest */
+	last_insert = t > 0 ? dset->pwlist[t - 1] : (unsigned int)(dset->nr - 1);
+	if(t < 100) {
+		LM_DBG("extra priority_weight slots %d for last destination in group %d\n",
+				(100 - t), dset->id);
+	}
+	for(j = t; j < 100; j++)
+		dset->pwlist[j] = last_insert;
+
+	/* shuffle the content of the array in order to mix the selection
+	 * of the addresses (e.g., if first address has weight=20, avoid
+	 * sending first 20 calls to it, but ensure that within a 100 calls,
+	 * 20 go to first address */
+	shuffle_uint100array(dset->pwlist);
+
+ret:
+	lock_release(&dset->lock);
+	pkg_free(ds_dests_flags);
+	pkg_free(ds_dests_weights);
+	pkg_free(ds_dests_priorities);
+	return 0;
+}
+
+
+/**
  * Initialize the weight distribution for a destination set
  * - fill the array of 0..99 elements where to keep the index of the
  *   destination address to be used. The Nth call will use
@@ -1074,6 +1209,7 @@ int reindex_dests(ds_set_t *node)
 	node->dlist = dp0;
 	dp_init_weights(node);
 	dp_init_relative_weights(node);
+	dp_init_priority_weights(node);
 
 	return 0;
 
@@ -2984,6 +3120,12 @@ int ds_manage_routes(
 			xavp_filled = 1;
 			break;
 		/* case DS_ALG_RRSERIAL: // 14 - round-robin or serial decided above */
+		case DS_ALG_PRIORITY_WEIGHT: /* 15 - priority then weight based distribution */
+			lock_get(&idx->lock);
+			hash = idx->pwlist[idx->pwlast];
+			idx->pwlast = (idx->pwlast + 1) % 100;
+			lock_release(&idx->lock);
+			break;
 		case DS_ALG_OVERLOAD: /* 64 - round robin with overload control */
 			lock_get(&idx->lock);
 			hash = idx->last;
@@ -3918,6 +4060,7 @@ int ds_reinit_rweight_on_state_change(
 	if((!ds_skip_dst(old_state) && ds_skip_dst(new_state))
 			|| (ds_skip_dst(old_state) && !ds_skip_dst(new_state))) {
 		dp_init_relative_weights(dset);
+		dp_init_priority_weights(dset);
 	}
 
 	return 0;
