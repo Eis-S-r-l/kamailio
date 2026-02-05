@@ -81,6 +81,7 @@
 #define DS_ALG_RELWEIGHT 11
 #define DS_ALG_PARALLEL 12
 #define DS_ALG_LATENCY 13
+#define DS_ALG_PRIORITY_WEIGHT 14
 #define DS_ALG_OVERLOAD 64 /* 2^6 - can be also used as a flag */
 
 #define DS_HN_SIZE 256
@@ -957,6 +958,131 @@ randomize:
 	return 0;
 }
 
+/**
+ * Initialize the priority-weight distribution for a destination set
+ * - first select all destinations with the highest priority
+ * - then distribute calls among them based on their weight
+ * - fill the array of 0..99 elements where to keep the index of the
+ *   destination address to be used
+ */
+int dp_init_priority_weights(ds_set_t *dset)
+{
+	int j;
+	int k;
+	int t;
+	int max_priority;
+	int weight_sum;
+
+	if(dset == NULL || dset->dlist == NULL)
+		return -1;
+
+	if(dset->nr <= 0)
+		return 0;
+
+	/* find the highest priority among active destinations */
+	max_priority = -1;
+	for(j = 0; j < dset->nr; j++) {
+		if(ds_skip_dst(dset->dlist[j].flags))
+			continue;
+		if(dset->dlist[j].priority > max_priority) {
+			max_priority = dset->dlist[j].priority;
+		}
+	}
+
+	if(max_priority < 0) {
+		/* no active destinations, fill with first destination as fallback */
+		for(t = 0; t < 100; t++) {
+			dset->pwlist[t] = 0;
+		}
+		return 0;
+	}
+
+	/* calculate the sum of weights for destinations with highest priority */
+	weight_sum = 0;
+	for(j = 0; j < dset->nr; j++) {
+		if(ds_skip_dst(dset->dlist[j].flags))
+			continue;
+		if(dset->dlist[j].priority == max_priority) {
+			weight_sum += dset->dlist[j].attrs.weight;
+		}
+	}
+
+	/* if no weights are set, distribute equally among highest priority destinations */
+	if(weight_sum == 0) {
+		int count = 0;
+		int *hp_indices = NULL;
+		int hp_count = 0;
+
+		/* count destinations with highest priority */
+		for(j = 0; j < dset->nr; j++) {
+			if(ds_skip_dst(dset->dlist[j].flags))
+				continue;
+			if(dset->dlist[j].priority == max_priority) {
+				hp_count++;
+			}
+		}
+
+		if(hp_count == 0) {
+			/* fallback: use first destination */
+			for(t = 0; t < 100; t++) {
+				dset->pwlist[t] = 0;
+			}
+			return 0;
+		}
+
+		/* fill array with equal distribution */
+		t = 0;
+		for(j = 0; j < dset->nr && t < 100; j++) {
+			if(ds_skip_dst(dset->dlist[j].flags))
+				continue;
+			if(dset->dlist[j].priority == max_priority) {
+				int slots = 100 / hp_count;
+				if(count == hp_count - 1) {
+					/* last one gets remaining slots */
+					slots = 100 - t;
+				}
+				for(k = 0; k < slots && t < 100; k++) {
+					dset->pwlist[t] = (unsigned int)j;
+					t++;
+				}
+				count++;
+			}
+		}
+	} else {
+		/* distribute based on weight (as percentage of weight_sum) */
+		t = 0;
+		for(j = 0; j < dset->nr; j++) {
+			if(ds_skip_dst(dset->dlist[j].flags))
+				continue;
+			if(dset->dlist[j].priority == max_priority) {
+				int slots = (dset->dlist[j].attrs.weight * 100) / weight_sum;
+				LM_DBG("priority-weight: dest[%d] priority[%d] weight[%d] "
+					   "weight_sum[%d] slots[%d]\n",
+						j, dset->dlist[j].priority,
+						dset->dlist[j].attrs.weight, weight_sum, slots);
+				for(k = 0; k < slots && t < 100; k++) {
+					dset->pwlist[t] = (unsigned int)j;
+					t++;
+				}
+			}
+		}
+		/* fill remaining slots with last highest priority destination */
+		if(t < 100) {
+			unsigned int last_hp = dset->pwlist[t > 0 ? t - 1 : 0];
+			LM_INFO("extra priority-weight %d for destination %u in group %d\n",
+					(100 - t), last_hp, dset->id);
+			for(; t < 100; t++) {
+				dset->pwlist[t] = last_hp;
+			}
+		}
+	}
+
+	/* shuffle the content of the array to mix the selection */
+	shuffle_uint100array(dset->pwlist);
+
+	return 0;
+}
+
 /*! \brief  compact destinations from sets for fast access */
 int reindex_dests(ds_set_t *node)
 {
@@ -999,6 +1125,7 @@ int reindex_dests(ds_set_t *node)
 	node->dlist = dp0;
 	dp_init_weights(node);
 	dp_init_relative_weights(node);
+	dp_init_priority_weights(node);
 
 	return 0;
 
@@ -2678,6 +2805,12 @@ int ds_manage_routes(sip_msg_t *msg, ds_select_state_t *rstate)
 				return -1;
 			xavp_filled = 1;
 			break;
+		case DS_ALG_PRIORITY_WEIGHT: /* 14 - priority first, then weight distribution */
+			lock_get(&idx->lock);
+			hash = idx->pwlist[idx->pwlast];
+			idx->pwlast = (idx->pwlast + 1) % 100;
+			lock_release(&idx->lock);
+			break;
 		case DS_ALG_OVERLOAD: /* 64 - round robin with overload control */
 			lock_get(&idx->lock);
 			hash = idx->last;
@@ -3294,8 +3427,10 @@ int ds_update_latency(int group, str *address, int code)
 	}
 
 	lock_release(&idx->lock);
-	if(cc.enabled && cc.apply_rweights)
+	if(cc.enabled && cc.apply_rweights) {
 		dp_init_relative_weights(idx);
+		dp_init_priority_weights(idx);
+	}
 	return state;
 }
 
@@ -3564,6 +3699,7 @@ int ds_reinit_rweight_on_state_change(
 	if((!ds_skip_dst(old_state) && ds_skip_dst(new_state))
 			|| (ds_skip_dst(old_state) && !ds_skip_dst(new_state))) {
 		dp_init_relative_weights(dset);
+		dp_init_priority_weights(dset);
 	}
 
 	return 0;
