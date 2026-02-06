@@ -33,6 +33,7 @@
 #include <string.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <limits.h>
 #include <time.h>
 #include <math.h>
 
@@ -960,7 +961,7 @@ randomize:
 
 /**
  * Initialize the priority-weight distribution for a destination set
- * - first select all destinations with the highest priority
+ * - first select all destinations with the best priority (lowest value, SRV convention)
  * - then distribute calls among them based on their weight
  * - fill the array of 0..99 elements where to keep the index of the
  *   destination address to be used
@@ -970,7 +971,7 @@ int dp_init_priority_weights(ds_set_t *dset)
 	int j;
 	int k;
 	int t;
-	int max_priority;
+	int best_priority;
 	int weight_sum;
 
 	if(dset == NULL || dset->dlist == NULL)
@@ -979,17 +980,17 @@ int dp_init_priority_weights(ds_set_t *dset)
 	if(dset->nr <= 0)
 		return 0;
 
-	/* find the highest priority among active destinations */
-	max_priority = -1;
+	/* find the best priority among active destinations (lowest value = highest priority, SRV convention) */
+	best_priority = INT_MAX;
 	for(j = 0; j < dset->nr; j++) {
 		if(ds_skip_dst(dset->dlist[j].flags))
 			continue;
-		if(dset->dlist[j].priority > max_priority) {
-			max_priority = dset->dlist[j].priority;
+		if(dset->dlist[j].priority < best_priority) {
+			best_priority = dset->dlist[j].priority;
 		}
 	}
 
-	if(max_priority < 0) {
+	if(best_priority == INT_MAX) {
 		/* no active destinations, fill with first destination as fallback */
 		for(t = 0; t < 100; t++) {
 			dset->pwlist[t] = 0;
@@ -997,31 +998,31 @@ int dp_init_priority_weights(ds_set_t *dset)
 		return 0;
 	}
 
-	/* calculate the sum of weights for destinations with highest priority */
+	/* calculate the sum of weights for destinations with best priority */
 	weight_sum = 0;
 	for(j = 0; j < dset->nr; j++) {
 		if(ds_skip_dst(dset->dlist[j].flags))
 			continue;
-		if(dset->dlist[j].priority == max_priority) {
+		if(dset->dlist[j].priority == best_priority) {
 			weight_sum += dset->dlist[j].attrs.weight;
 		}
 	}
 
-	/* if no weights are set, distribute equally among highest priority destinations */
+	/* if no weights are set, distribute equally among best priority destinations */
 	if(weight_sum == 0) {
 		int count = 0;
-		int hp_count = 0;
+		int bp_count = 0;
 
-		/* count destinations with highest priority */
+		/* count destinations with best priority */
 		for(j = 0; j < dset->nr; j++) {
 			if(ds_skip_dst(dset->dlist[j].flags))
 				continue;
-			if(dset->dlist[j].priority == max_priority) {
-				hp_count++;
+			if(dset->dlist[j].priority == best_priority) {
+				bp_count++;
 			}
 		}
 
-		if(hp_count == 0) {
+		if(bp_count == 0) {
 			/* fallback: use first destination */
 			for(t = 0; t < 100; t++) {
 				dset->pwlist[t] = 0;
@@ -1034,9 +1035,9 @@ int dp_init_priority_weights(ds_set_t *dset)
 		for(j = 0; j < dset->nr && t < 100; j++) {
 			if(ds_skip_dst(dset->dlist[j].flags))
 				continue;
-			if(dset->dlist[j].priority == max_priority) {
-				int slots = 100 / hp_count;
-				if(count == hp_count - 1) {
+			if(dset->dlist[j].priority == best_priority) {
+				int slots = 100 / bp_count;
+				if(count == bp_count - 1) {
 					/* last one gets remaining slots */
 					slots = 100 - t;
 				}
@@ -1053,7 +1054,7 @@ int dp_init_priority_weights(ds_set_t *dset)
 		for(j = 0; j < dset->nr; j++) {
 			if(ds_skip_dst(dset->dlist[j].flags))
 				continue;
-			if(dset->dlist[j].priority == max_priority) {
+			if(dset->dlist[j].priority == best_priority) {
 				int slots = (dset->dlist[j].attrs.weight * 100) / weight_sum;
 				LM_DBG("priority-weight: dest[%d] priority[%d] weight[%d] "
 					   "weight_sum[%d] slots[%d]\n",
@@ -1065,13 +1066,13 @@ int dp_init_priority_weights(ds_set_t *dset)
 				}
 			}
 		}
-		/* fill remaining slots with last highest priority destination */
+		/* fill remaining slots with last best priority destination */
 		if(t < 100) {
-			unsigned int last_hp = dset->pwlist[t > 0 ? t - 1 : 0];
+			unsigned int last_bp = dset->pwlist[t > 0 ? t - 1 : 0];
 			LM_INFO("extra priority-weight %d for destination %u in group %d\n",
-					(100 - t), last_hp, dset->id);
+					(100 - t), last_bp, dset->id);
 			for(; t < 100; t++) {
-				dset->pwlist[t] = last_hp;
+				dset->pwlist[t] = last_bp;
 			}
 		}
 	}
